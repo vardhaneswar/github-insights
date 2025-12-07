@@ -1,0 +1,10 @@
+[PR #464] fix: h100-mfu-calculation
+
+Author: functionstackx
+State: closed
+
+I was getting 104% MFU on h100 then i realized that MFU calculation might of been based on a100 312 tflops 
+
+h100 is 989 tflops at bfloat16. nvidia claims 1,979tflops but that is for 2:4 sparsity.
+
+<img width="515" alt="image" src="https://github.com/karpathy/nanoGPT/assets/47992694/7ed83ae5-3769-4c48-91a6-7cc4d8f6e140"

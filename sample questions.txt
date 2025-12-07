@@ -1,0 +1,5 @@
+{
+  "url": "https://github.com/karpathy/nanoGPT",
+  "question": "who is the owner of this repo",
+  "time_window_days": 180
+}
