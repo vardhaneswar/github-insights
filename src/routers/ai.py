@@ -1,46 +1,90 @@
 # src/routers/ai.py
 
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
-from src.core.rag_answer import summarize_repo
+from fastapi import APIRouter
+from pydantic import BaseModel, HttpUrl
+
+from src.core.rag_answer import answer_question, summarize_repo
+from src.core.user_activity import get_user_activity
 
 
-from src.core.rag_answer import answer_question
+router = APIRouter(tags=["AI"])
 
-router = APIRouter()
 
+# ---------------------------
+# REQUEST MODELS
+# ---------------------------
 
 class AIQueryRequest(BaseModel):
-    url: str
+    url: HttpUrl
     question: str
-    time_window_days: int = 7
-
-
-@router.post("/query")
-def ai_query(req: AIQueryRequest):
-    try:
-        result = answer_question(
-            repo_url=req.url,
-            question=req.question,
-            time_window_days=req.time_window_days,
-        )
-        return {"status": "success", "data": result}
-    except NotImplementedError as e:
-        # llm_client not wired yet
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
 
 
 class AISummaryRequest(BaseModel):
-    url: str
-    time_window_days: int = 7
+    url: HttpUrl
+    time_window_days: int = 7     # unified naming
 
 
-@router.post("/api/ai/summary")
-def summarize_repo_api(req: AISummaryRequest):
-    summary = summarize_repo(
-        repo_url=req.url,
-        time_window_days=req.time_window_days
+class UserActivityRequest(BaseModel):
+    url: HttpUrl
+    user: str
+    time_window_days: int = 1     # default: "today"
+
+
+# ---------------------------
+# ENDPOINT: Free-form AI Query
+# ---------------------------
+
+@router.post("/query")
+def query_ai(req: AIQueryRequest):
+    """
+    Universal natural-language GitHub RAG question.
+    Example:
+    {
+        "url": "https://github.com/karpathy/nanoGPT",
+        "question": "Who worked on this repo yesterday?"
+    }
+    """
+    result = answer_question(
+        repo_url=str(req.url),
+        question=req.question,
     )
-    return summary
+    return {"status": "success", "data": result}
+
+
+# ---------------------------
+# ENDPOINT: Executive Summary
+# ---------------------------
+
+@router.post("/summary")
+def summarize_repo_api(req: AISummaryRequest):
+    """
+    Summarizes recent repository activity for managers.
+    """
+    result = summarize_repo(
+        repo_url=str(req.url),
+        time_window_days=req.time_window_days,
+    )
+    return {"status": "success", "data": result}
+
+
+# ---------------------------
+# ENDPOINT: User Activity (Dev-level summary)
+# ---------------------------
+
+@router.post("/user-activity")
+def user_activity_api(req: UserActivityRequest):
+    """
+    Returns commit/PR/file/folder activity for a specific developer.
+    Example:
+    {
+        "url": "https://github.com/karpathy/nanoGPT",
+        "user": "karpathy",
+        "time_window_days": 7
+    }
+    """
+    result = get_user_activity(
+        repo_url=str(req.url),
+        username=req.user,
+        time_window_days=req.time_window_days,
+    )
+    return {"status": "success", "data": result}

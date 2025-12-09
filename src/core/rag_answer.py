@@ -6,7 +6,6 @@ from typing import Dict, Any, List
 from src.services.github_service import (
     extract_owner_repo,
     get_commits,
-    get_pull_requests,
 )
 from src.core.vectorstore import query_similar
 from src.core.metrics import commits_per_day, commits_per_week, top_contributors
@@ -14,15 +13,15 @@ from src.core.llm_client import generate_answer_from_llm
 
 
 # ---------------------------------------------------------
-# 1) TIME-WINDOW FILTER
+# 1) FILTER COMMITS BY DAYS
 # ---------------------------------------------------------
 
-def _filter_commits_by_days(commits: List[Dict[str, Any]], days: int) -> List[Dict[str, Any]]:
-    """Return only commits from the last N days."""
+def _filter_commits_by_days(commits: List[Dict[str, Any]], days: int | None) -> List[Dict[str, Any]]:
+    """Return only commits from last N days. If days=None → no filtering."""
     if days is None:
         return commits
 
-    now = datetime.now(timezone.utc)            # FIX: timezone-aware
+    now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=days)
 
     filtered = []
@@ -31,9 +30,7 @@ def _filter_commits_by_days(commits: List[Dict[str, Any]], days: int) -> List[Di
         if not date_str:
             continue
 
-        # Make commit timestamp timezone aware
         dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-
         if dt >= cutoff:
             filtered.append(c)
 
@@ -44,86 +41,121 @@ def _filter_commits_by_days(commits: List[Dict[str, Any]], days: int) -> List[Di
 # 2) METRICS BLOCK
 # ---------------------------------------------------------
 
-def _build_metrics_block(repo_url: str, time_window_days: int) -> Dict[str, Any]:
-    """Compute commit statistics for the last N days."""
+def _build_metrics_block(repo_url: str, time_window_days: int | None) -> Dict[str, Any]:
+    """Compute commit statistics for the given time window."""
     commits = get_commits(repo_url)
     commits_recent = _filter_commits_by_days(commits, time_window_days)
 
-    metrics = {
+    return {
         "total_commits_recent": len(commits_recent),
         "commits_per_day": commits_per_day(commits_recent),
         "commits_per_week": commits_per_week(commits_recent),
         "top_contributors": top_contributors(commits_recent, limit=5),
     }
-    return metrics
 
 
 # ---------------------------------------------------------
-# 3) RETRIEVAL CONTEXT
+# 3) EMBEDDING RETRIEVAL CONTEXT
 # ---------------------------------------------------------
 
 def _build_context_snippets(repo_full_name: str, question: str, k: int = 15) -> List[str]:
-    """Return retrieved commit/PR texts for the repo."""
     res = query_similar(repo_full_name, question, k)
     docs = res.get("documents") or [[]]
-    return docs[0]       # Take only the first query
+    return docs[0]
 
 
 # ---------------------------------------------------------
-# 4) MAIN RAG ANSWERING PIPELINE
+# 4) AUTOMATIC TIME WINDOW DETECTION
+# ---------------------------------------------------------
+
+def infer_time_window(question: str) -> int | None:
+    """Infer a proper time window from natural language."""
+    q = question.lower()
+
+    if "today" in q:
+        return 1
+    if "yesterday" in q:
+        return 2
+
+    if "this week" in q or "past week" in q or "last week" in q:
+        return 7
+    if "recent" in q or "recently" in q:
+        return 7
+
+    if "this month" in q or "last month" in q or "past month" in q:
+        return 30
+
+    if "this year" in q or "last year" in q or "past year" in q:
+        return 365
+
+    if any(k in q for k in ["why", "how", "architecture", "tokenizer", "design", "model"]):
+        return None  # semantic question → full history
+
+    return 30
+
+
+# ---------------------------------------------------------
+# 5) MAIN RAG ANSWERING PIPELINE
 # ---------------------------------------------------------
 
 def answer_question(
     repo_url: str,
     question: str,
-    time_window_days: int = 7,
     k: int = 15,
 ) -> Dict[str, Any]:
-    """
-    Steps:
-    1. Resolve repo
-    2. Compute metrics
-    3. Retrieve context from vector DB
-    4. Build a prompt
-    5. Ask the LLM
-    6. Return structured result
-    """
+
     owner, repo = extract_owner_repo(repo_url)
     repo_full_name = f"{owner}/{repo}"
 
-    # (1) Metrics
+    # (A) detect time window automatically
+    time_window_days = infer_time_window(question)
+
+    # (B) compute metrics
     metrics = _build_metrics_block(repo_url, time_window_days)
 
-    # (2) Vector DB retrieval
-    context_snippets = _build_context_snippets(repo_full_name, question, k=k)
+    # (C) return early if no commits exist
+    if metrics["total_commits_recent"] == 0:
+        return {
+            "repo": repo_full_name,
+            "question": question,
+            "time_window_used": time_window_days,
+            "answer": "No activity in this period.",
+            "metrics": metrics,
+            "used_context": [],
+        }
 
-    # Prepare context
+    # (D) semantic retrieval
+    context_snippets = _build_context_snippets(repo_full_name, question, k=k)
     context_text = "\n\n---\n\n".join(context_snippets[:k])
 
-    # Build metrics block text
     metrics_block = (
-        f"- Total commits (last {time_window_days} days): {metrics['total_commits_recent']}\n"
+        f"- Time Window: {time_window_days if time_window_days else 'full history'}\n"
+        f"- Total commits: {metrics['total_commits_recent']}\n"
         f"- Commits per day: {metrics['commits_per_day']}\n"
         f"- Commits per week: {metrics['commits_per_week']}\n"
         f"- Top contributors: {metrics['top_contributors']}\n"
     )
 
-    # System prompt
+    # strict hallucination-preventing system prompt
     system_msg = (
-        "You are an AI assistant analyzing GitHub repository activity.\n"
-        "You are given commit texts, PR texts, and repo metrics.\n"
-        "Base your answer ONLY on the information provided.\n"
-        "If something is unclear or missing, say so.\n"
+        "You are an AI assistant that analyzes GitHub activity.\n"
+        "RULES:\n"
+        "- The time window filter is already applied before you see data.\n"
+        "- NEVER mention dates, timestamps, or missing date information.\n"
+        "- NEVER say you need the current date.\n"
+        "- ONLY describe what happened based on the commits provided.\n"
+        "- NEVER talk about contributors not present in this filtered data.\n"
+        "- NEVER use old data outside the time window.\n"
+        "- If there are no commits → you will NEVER be called. Python handles that.\n"
+        "- Be short, factual, confident.\n"
+        "- ZERO hallucinations. Use ONLY context and metrics.\n"
     )
 
-    # User prompt
     user_prompt = f"""
 Repository: {repo_full_name}
 
 Question:
 {question}
-
-Time window: last {time_window_days} days
 
 [METRICS]
 {metrics_block}
@@ -131,8 +163,8 @@ Time window: last {time_window_days} days
 [CONTEXT - COMMITS & PRs]
 {context_text}
 
-Using ONLY the context and metrics above, answer the question clearly.
-If the question implies 'recent changes', focus on last {time_window_days} days.
+Provide a short factual answer ONLY using the above information.
+Do NOT mention dates, time, or missing data.
 """
 
     messages = [
@@ -140,20 +172,21 @@ If the question implies 'recent changes', focus on last {time_window_days} days.
         {"role": "user", "content": user_prompt},
     ]
 
-    # (4) Ask the LLM
     answer_text = generate_answer_from_llm(messages)
 
-    # (5) Final structured return
     return {
         "repo": repo_full_name,
         "question": question,
+        "time_window_used": time_window_days,
         "answer": answer_text,
         "metrics": metrics,
         "used_context": context_snippets[:k],
     }
 
 
-
+# ---------------------------------------------------------
+# 6) SUMMARY ENDPOINT
+# ---------------------------------------------------------
 
 def summarize_repo(
     repo_url: str,
@@ -164,16 +197,12 @@ def summarize_repo(
     owner, repo = extract_owner_repo(repo_url)
     repo_full_name = f"{owner}/{repo}"
 
-    # 1) Metrics
     metrics = _build_metrics_block(repo_url, time_window_days)
-
-    # 2) Semantic context (top commit/PR snippets)
     context_snippets = _build_context_snippets(repo_full_name, "recent activity", k=k)
     context_text = "\n\n---\n\n".join(context_snippets)
 
-    # 3) Build summary prompt
     summary_prompt = f"""
-You are an AI that summarizes GitHub repository activity for engineering managers.
+You are an AI summarizing GitHub repository activity.
 
 Repository: {repo_full_name}
 Time Window: last {time_window_days} days
@@ -184,17 +213,17 @@ Time Window: last {time_window_days} days
 - Commits per week: {metrics["commits_per_week"]}
 - Top contributors: {metrics["top_contributors"]}
 
-[CONTEXT - COMMITS & PULL REQUESTS]
+[CONTEXT]
 {context_text}
 
-Write a short, clear **executive summary** including:
+Write a concise executive summary including:
 1. Main changes
-2. Improvements or refactors
-3. Notable discussions or PRs
-4. Risks or important blockers
-5. Momentum level (low / medium / high)
+2. Improvements / refactors
+3. Notable PRs
+4. Risks / blockers
+5. Momentum (low / medium / high)
 
-Keep it concise and factual. Do NOT invent data.
+Do NOT hallucinate. Use only given data.
 """
 
     messages = [
@@ -202,7 +231,6 @@ Keep it concise and factual. Do NOT invent data.
         {"role": "user", "content": summary_prompt},
     ]
 
-    # 4) LLM call
     summary_text = generate_answer_from_llm(messages)
 
     return {

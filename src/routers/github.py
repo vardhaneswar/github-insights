@@ -1,54 +1,78 @@
 from fastapi import APIRouter, HTTPException, Query
-from src.services.github_service import get_repo_info
-from src.services.github_service import get_repo_info, get_commits
-from src.services.github_service import get_pull_requests
-from src.services.github_service import get_contributors
-from src.services.github_service import get_branches
+from src.services.github_service import (
+    get_repo_info,
+    get_commits,
+    get_pull_requests,
+    get_contributors,
+    get_branches
+)
 
 router = APIRouter()
 
+# Default repo (fallback)
+DEFAULT_REPO = "https://github.com/vardhaneswar/Image-classification"
+
+
+def resolve_repo(url: str | None):
+    """Return URL if provided, else default repo."""
+    return url if url else DEFAULT_REPO
+
+
+# -------------------------
+#   REPO INFO
+# -------------------------
 @router.get("/info")
-def repo_info(url: str = Query(..., description="GitHub repository URL")):
+def repo_info(url: str = Query(None)):
     try:
-        data = get_repo_info(url)
-        return {"status": "success", "data": data}
+        repo = resolve_repo(url)
+        return get_repo_info(repo)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+
+# -------------------------
+#   COMMITS
+# -------------------------
 @router.get("/commits")
-def repo_commits(url: str):
+def repo_commits(url: str = Query(None)):
     try:
-        commits = get_commits(url)
-        return {"status": "success", "count": len(commits), "data": commits}
+        repo = resolve_repo(url)
+        return get_commits(repo)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-    
 
 
+# -------------------------
+#   PULL REQUESTS
+# -------------------------
 @router.get("/pulls")
-def repo_pull_requests(url: str, state: str = "all"):
+def repo_pull_requests(url: str = Query(None), state: str = "all"):
     try:
-        prs = get_pull_requests(url, state=state)
-        return {"status": "success", "count": len(prs), "data": prs}
+        repo = resolve_repo(url)
+        return get_pull_requests(repo, state=state)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
+# -------------------------
+#   CONTRIBUTORS
+# -------------------------
 @router.get("/contributors")
-def repo_contributors(url: str):
+def repo_contributors(url: str = Query(None)):
     try:
-        contributors = get_contributors(url)
-        return {"status": "success", "count": len(contributors), "data": contributors}
+        repo = resolve_repo(url)
+        return get_contributors(repo)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-    
 
-    
 
+# -------------------------
+#   BRANCHES
+# -------------------------
 @router.get("/branches")
-def repo_branches(url: str):
+def repo_branches(url: str = Query(None)):
     try:
-        branches = get_branches(url)
-        return {"status": "success", "count": len(branches), "data": branches}
+        repo = resolve_repo(url)
+        return get_branches(repo)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
